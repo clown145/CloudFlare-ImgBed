@@ -19,6 +19,22 @@ const corsHeaders = {
     'Access-Control-Max-Age': '86400',
 };
 
+function getBearerToken(request) {
+    const authHeader = request.headers.get('Authorization') || '';
+    return authHeader.startsWith('Bearer ') ? authHeader.substring(7) : authHeader;
+}
+
+async function isWebDAVInternalRequest(request, db) {
+    if (request.headers.get('X-WebDAV-Internal') !== '1') {
+        return false;
+    }
+
+    const settingsStr = await db.get('manage@sysConfig@others');
+    const settings = settingsStr ? JSON.parse(settingsStr) : {};
+    const internalToken = settings.webDAV?.internalToken;
+    return !!internalToken && getBearerToken(request) === internalToken;
+}
+
 export async function onRequest(context) {
     const { request, env, params, waitUntil } = context;
 
@@ -81,10 +97,25 @@ export async function onRequest(context) {
         }
 
         // 路径安全处理
-        const newFileId = sanitizeUploadFolder(body.newFileId.trim());
+        const hasTrailingSlash = body.newFileId.endsWith('/');
+        let newFileId = sanitizeUploadFolder(body.newFileId.trim());
+        if (hasTrailingSlash && !newFileId.endsWith('/')) {
+            newFileId += '/';
+        }
 
         const url = new URL(request.url);
         const db = getDatabase(env);
+        const allowOverwrite = body.overwrite === true && await isWebDAVInternalRequest(request, db);
+
+        if (body.overwrite === true && !allowOverwrite) {
+            return new Response(JSON.stringify({
+                success: false,
+                message: 'overwrite is reserved for internal WebDAV operations',
+            }), {
+                status: 403,
+                headers: { 'Content-Type': 'application/json', ...corsHeaders },
+            });
+        }
 
         // 获取当前文件数据
         const fileData = await db.getWithMetadata(fileId);
@@ -100,15 +131,17 @@ export async function onRequest(context) {
         }
 
         // 检查目标 File_ID 是否已存在（重复性检测）
-        const existingFile = await db.getWithMetadata(newFileId);
-        if (existingFile && existingFile.value !== null) {
-            return new Response(JSON.stringify({
-                success: false,
-                message: '目标文件名已存在',
-            }), {
-                status: 409,
-                headers: { 'Content-Type': 'application/json', ...corsHeaders },
-            });
+        if (!allowOverwrite) {
+            const existingFile = await db.getWithMetadata(newFileId);
+            if (existingFile && existingFile.value !== null) {
+                return new Response(JSON.stringify({
+                    success: false,
+                    message: '目标文件名已存在',
+                }), {
+                    status: 409,
+                    headers: { 'Content-Type': 'application/json', ...corsHeaders },
+                });
+            }
         }
 
         // 执行文件迁移
@@ -149,8 +182,8 @@ export async function onRequest(context) {
             metadata.WebDAVFilePath = newFileId;
         }
 
-        // 旧版 Telegram 渠道和 Telegraph 渠道不支持重命名
-        if (metadata?.Channel === 'Telegram' || metadata?.Channel === undefined) {
+        // 旧版 Telegram 渠道和 Telegraph 渠道不支持重命名（但文件夹目录记录本身是纯 KV 记录，不受此限制）
+        if ((metadata?.Channel === 'Telegram' || metadata?.Channel === undefined) && metadata?.FileType !== 'directory') {
             return new Response(JSON.stringify({
                 success: false,
                 message: '旧版 Telegram/Telegraph 渠道不支持重命名',

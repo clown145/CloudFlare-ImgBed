@@ -2,11 +2,15 @@
 import { fetchOthersConfig } from "../utils/sysConfig";
 import { getDatabase } from "../utils/databaseAdapter";
 import { createApiToken } from "../api/manage/apiTokens";
+import { addFileToIndex } from "../utils/indexManager";
+import { sanitizeFileName, sanitizeUploadFolder } from "../upload/uploadTools";
+
+const WEBDAV_INTERNAL_TOKEN_NAME = 'WebDAV Internal Token';
+const WEBDAV_INTERNAL_PERMISSIONS = ['list', 'upload', 'delete', 'manage'];
 
 export async function onRequest(context) {
     const { request, env } = context;
 
-    // WebDAV 规范：如果请求的是根目录 /dav 但没有斜杠，重定向到 /dav/，以保证客户端的 href 匹配
     const url = new URL(request.url);
     if (url.pathname === '/dav') {
         url.pathname = '/dav/';
@@ -16,23 +20,151 @@ export async function onRequest(context) {
     const authResponse = await checkAuth(request, env);
     if (authResponse) return authResponse;
 
-    // 从请求路径中替换第一个 /dav 部分
     url.pathname = url.pathname.replace(/^\/dav/, '') || '/';
     const modifiedRequest = new Request(url.toString(), request);
 
     switch (modifiedRequest.method) {
         case 'OPTIONS': return handleOptions(modifiedRequest);
+        case 'HEAD': return handleHead(modifiedRequest, env);
         case 'PROPFIND': return handlePropfind(modifiedRequest, env);
         case 'PUT': return handlePut(modifiedRequest, env);
         case 'DELETE': return handleDelete(modifiedRequest, env);
         case 'GET': return handleGet(modifiedRequest, env);
         case 'MOVE': return handleMove(modifiedRequest, env, context);
-        case 'MKCOL': return new Response(null, { status: 201 });
+        case 'MKCOL': return handleMkcol(modifiedRequest, env);
         default: return new Response('Method Not Allowed', { status: 405 });
     }
 }
 
 // --- UTILITY FUNCTIONS ---
+
+function isWebDAVInternalToken(tokenData) {
+    return tokenData?.type === 'internal'
+        || (tokenData?.owner === 'system' && tokenData?.name === WEBDAV_INTERNAL_TOKEN_NAME);
+}
+
+function setNoStoreHeaders(headers) {
+    headers.set('Cache-Control', 'no-store');
+    headers.set('Pragma', 'no-cache');
+    headers.set('Expires', '0');
+}
+
+function createNoStoreFetchInit(init = {}) {
+    const headers = new Headers(init.headers);
+    setNoStoreHeaders(headers);
+    headers.set('X-WebDAV-Internal', '1');
+
+    return {
+        ...init,
+        headers,
+        cf: {
+            ...init.cf,
+            cacheTtl: 0,
+            cacheEverything: false,
+        },
+    };
+}
+
+async function saveWebDAVInternalToken(db, token, tokenId) {
+    const settingsStr = await db.get('manage@sysConfig@others');
+    const settings = settingsStr ? JSON.parse(settingsStr) : {};
+    if (!settings.webDAV) settings.webDAV = {};
+    settings.webDAV.internalToken = token;
+    settings.webDAV.internalTokenId = tokenId;
+    await db.put('manage@sysConfig@others', JSON.stringify(settings));
+}
+
+async function collectionExists(env, request, path) {
+    const cleanPath = path.replace(/^\/+|\/+$/g, '');
+    if (!cleanPath) return false;
+
+    const db = getDatabase(env);
+    const prefix = `${cleanPath}/`;
+    const existing = await db.getWithMetadata(prefix);
+    if (existing && existing.value !== null) {
+        return true;
+    }
+
+    const listUrl = new URL('/api/manage/list', request.url);
+    listUrl.searchParams.set('dir', cleanPath);
+    listUrl.searchParams.set('count', '1');
+    const listResponse = await fetch(listUrl.toString(), { headers: await getApiHeaders(env) });
+    if (!listResponse.ok) {
+        throw new Error(`Failed to check collection: ${listResponse.status}`);
+    }
+
+    const result = await listResponse.json();
+    return (result.files && result.files.length > 0)
+        || (result.directories && result.directories.length > 0);
+}
+
+async function fileExists(db, path) {
+    const fileData = await db.getWithMetadata(path);
+    return !!(fileData && fileData.value !== null && fileData.metadata?.FileType !== 'directory');
+}
+
+async function resourceExists(env, request, path) {
+    const cleanPath = path.replace(/^\/+|\/+$/g, '');
+    if (!cleanPath) {
+        return {
+            exists: true,
+            isFolder: true,
+            isFile: false,
+        };
+    }
+
+    const db = getDatabase(env);
+    const fileData = await db.getWithMetadata(cleanPath);
+    const isFile = !!(fileData && fileData.value !== null && fileData.metadata?.FileType !== 'directory');
+    const isFolder = await collectionExists(env, request, cleanPath);
+
+    return {
+        exists: isFile || isFolder,
+        isFile,
+        isFolder,
+        fileData,
+    };
+}
+
+async function deleteResource(env, request, path, isFolder) {
+    const cleanPath = path.replace(/^\/+|\/+$/g, '');
+    if (!cleanPath) {
+        return { success: false, message: 'Cannot delete root collection' };
+    }
+
+    const deleteUrl = new URL(`/api/manage/delete/${encodeURIComponent(cleanPath)}`, request.url);
+    if (isFolder) {
+        deleteUrl.searchParams.set('folder', 'true');
+    }
+
+    const response = await fetch(deleteUrl.toString(), {
+        method: 'DELETE',
+        headers: await getApiHeaders(env)
+    });
+
+    let result = null;
+    const responseText = await response.text();
+    try {
+        result = responseText ? JSON.parse(responseText) : null;
+    } catch (error) {
+        result = null;
+    }
+
+    if (!response.ok || result?.success === false) {
+        return {
+            success: false,
+            status: response.status,
+            message: result?.error || result?.message || responseText || response.statusText || 'Delete failed',
+        };
+    }
+
+    return { success: true, result };
+}
+
+function isUnsupportedMoveMetadata(metadata) {
+    return (metadata?.Channel === 'Telegram' || metadata?.Channel === undefined)
+        && metadata?.FileType !== 'directory';
+}
 
 async function getApiHeaders(env) {
     const othersConfig = await fetchOthersConfig(env);
@@ -41,12 +173,31 @@ async function getApiHeaders(env) {
 
     const db = getDatabase(env);
 
-    // token 不存在时自动创建并更新 WebDAV 设置
-    if (!token) {
+    const securityStr = await db.get('manage@sysConfig@security');
+    const securitySettings = securityStr ? JSON.parse(securityStr) : {};
+    if (!securitySettings.apiTokens) securitySettings.apiTokens = {};
+    if (!securitySettings.apiTokens.tokens) securitySettings.apiTokens.tokens = {};
+    const tokens = securitySettings.apiTokens.tokens;
+
+    let tokenData = tokenId && tokens[tokenId] ? tokens[tokenId] : null;
+    let securityChanged = false;
+
+    if (!tokenData && token) {
+        for (const [id, data] of Object.entries(tokens)) {
+            if (data.token === token && isWebDAVInternalToken(data)) {
+                tokenId = id;
+                tokenData = data;
+                await saveWebDAVInternalToken(db, token, tokenId);
+                break;
+            }
+        }
+    }
+
+    if (!token || !tokenData || !isWebDAVInternalToken(tokenData)) {
         const tokenResult = await createApiToken(
             db,
-            'WebDAV Internal Token',
-            ['list', 'upload', 'delete', 'manage'],
+            WEBDAV_INTERNAL_TOKEN_NAME,
+            WEBDAV_INTERNAL_PERMISSIONS,
             'system',
             null,
             false,
@@ -54,25 +205,31 @@ async function getApiHeaders(env) {
         );
         token = tokenResult.token;
         tokenId = tokenResult.id;
+        await saveWebDAVInternalToken(db, token, tokenId);
+    } else {
+        token = tokenData.token;
 
-        // 更新 others config 中的 WebDAV 设置
-        const settingsStr = await db.get('manage@sysConfig@others');
-        const settings = settingsStr ? JSON.parse(settingsStr) : {};
-        if (!settings.webDAV) settings.webDAV = {};
-        settings.webDAV.internalToken = token;
-        settings.webDAV.internalTokenId = tokenResult.id;
-        await db.put('manage@sysConfig@others', JSON.stringify(settings));
-    } else if (tokenId) {
-        // 自愈：确保已存在的 token 具有 'manage' 权限，以便执行 MOVE 操作
-        const settingsStr = await db.get('manage@sysConfig@security');
-        const settings = settingsStr ? JSON.parse(settingsStr) : {};
-        if (settings.apiTokens?.tokens?.[tokenId]) {
-            const tokenData = settings.apiTokens.tokens[tokenId];
-            if (!tokenData.permissions.includes('manage')) {
-                tokenData.permissions.push('manage');
-                tokenData.updatedAt = new Date().toISOString();
-                await db.put('manage@sysConfig@security', JSON.stringify(settings));
+        const permissions = Array.isArray(tokenData.permissions) ? tokenData.permissions : [];
+        for (const permission of WEBDAV_INTERNAL_PERMISSIONS) {
+            if (!permissions.includes(permission)) {
+                permissions.push(permission);
+                securityChanged = true;
             }
+        }
+
+        if (tokenData.type !== 'internal') {
+            tokenData.type = 'internal';
+            securityChanged = true;
+        }
+
+        if (securityChanged) {
+            tokenData.permissions = permissions;
+            tokenData.updatedAt = new Date().toISOString();
+            await db.put('manage@sysConfig@security', JSON.stringify(securitySettings));
+        }
+
+        if (tokenId !== othersConfig.webDAV.internalTokenId || token !== othersConfig.webDAV.internalToken) {
+            await saveWebDAVInternalToken(db, token, tokenId);
         }
     }
 
@@ -118,11 +275,51 @@ function handleOptions(request) {
     return new Response(null, {
         status: 200,
         headers: {
-            'Allow': 'OPTIONS, GET, PUT, DELETE, PROPFIND, MOVE, MKCOL',
+            'Allow': 'OPTIONS, HEAD, GET, PUT, DELETE, PROPFIND, MOVE, MKCOL',
             'DAV': '1',
             'MS-Author-Via': 'DAV',
         },
     });
+}
+
+async function handleHead(request, env) {
+    const path = decodeURIComponent(new URL(request.url).pathname);
+
+    if (path.endsWith('/')) {
+        if (path !== '/') {
+            const dir = path.startsWith('/') ? path.substring(1) : path;
+            const resource = await resourceExists(env, request, dir);
+            if (!resource.isFolder) {
+                return new Response(null, { status: 404 });
+            }
+        }
+
+        return new Response(null, {
+            status: 200,
+            headers: {
+                'Content-Type': 'text/html; charset=utf-8',
+                'DAV': '1',
+                'Cache-Control': 'no-store',
+            },
+        });
+    }
+
+    try {
+        const fileUrl = new URL(request.url);
+        fileUrl.pathname = `/file${fileUrl.pathname}`;
+        const fileResponse = await fetch(fileUrl.toString(), createNoStoreFetchInit({ method: 'HEAD' }));
+
+        const response = new Response(null, {
+            status: fileResponse.status,
+            statusText: fileResponse.statusText,
+            headers: fileResponse.headers,
+        });
+        setNoStoreHeaders(response.headers);
+        return response;
+    } catch (error) {
+        console.error('HEAD failed:', error.stack);
+        return new Response(null, { status: 500 });
+    }
 }
 
 async function handleGet(request, env) {
@@ -133,16 +330,22 @@ async function handleGet(request, env) {
             const dir = path === '/' ? '' : path.substring(1, path.length - 1);
             const contents = await fetchDirectoryContents(dir, env, request);
             const html = generateDirectoryListingHtml(path, contents);
-            return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+            return new Response(html, {
+                headers: {
+                    'Content-Type': 'text/html; charset=utf-8',
+                    'Cache-Control': 'no-store',
+                },
+            });
         } catch (error) {
             console.error('GET (directory) failed:', error.stack);
             return new Response(`Error listing directory: ${error.message}`, { status: 500 });
         }
     } else { // File download
         try {
-            const fileUrl = new URL(`/file${path}`, request.url);
+            const fileUrl = new URL(request.url);
+            fileUrl.pathname = `/file${fileUrl.pathname}`;
 
-            const fileResponse = await fetch(fileUrl.toString());
+            const fileResponse = await fetch(fileUrl.toString(), createNoStoreFetchInit());
 
             if (!fileResponse.ok) {
                  return new Response('File not found', { status: fileResponse.status, statusText: fileResponse.statusText });
@@ -150,6 +353,7 @@ async function handleGet(request, env) {
 
             const response = new Response(fileResponse.body, fileResponse);
             response.headers.set('Access-Control-Allow-Origin', '*');
+            setNoStoreHeaders(response.headers);
 
             return response;
         } catch (error) {
@@ -166,34 +370,50 @@ async function handlePut(request, env) {
     }
 
     const lastSlashIndex = fullPath.lastIndexOf('/');
-    let uploadFolder = lastSlashIndex > -1 ? fullPath.substring(0, lastSlashIndex) : '';
+    const rawUploadFolder = lastSlashIndex > -1 ? fullPath.substring(0, lastSlashIndex) : '';
     const fileName = lastSlashIndex > -1 ? fullPath.substring(lastSlashIndex + 1) : fullPath;
+    let uploadFolder = '';
+    let targetPath = '';
 
-    // 路径安全处理：防止路径穿越
-    if (uploadFolder) {
-        // 防止双重编码绕过：仅在检测到编码字符时解码
-        if (/%[0-9a-fA-F]{2}/.test(uploadFolder)) {
-            try { uploadFolder = decodeURIComponent(uploadFolder); } catch (e) { /* ignore */ }
+    try {
+        uploadFolder = sanitizeUploadFolder(rawUploadFolder);
+        const sanitizedFileName = sanitizeFileName(fileName);
+        if (!sanitizedFileName) {
+            return new Response('Invalid file name', { status: 400 });
         }
-        uploadFolder = uploadFolder
-            .replace(/\.\./g, '_')
-            .replace(/\\/g, '/')
-            .replace(/\/{2,}/g, '/')
-            .replace(/^\/+/, '')
-            .replace(/\/+$/, '');
+        targetPath = uploadFolder ? `${uploadFolder}/${sanitizedFileName}` : sanitizedFileName;
+    } catch (error) {
+        return new Response('Invalid file name', { status: 400 });
     }
-    
+
+    try {
+        if (await collectionExists(env, request, targetPath)) {
+            return new Response('Conflict: collection exists with the same name', { status: 409 });
+        }
+
+        const db = getDatabase(env);
+        if (await fileExists(db, targetPath)) {
+            const deleteResult = await deleteResource(env, request, targetPath, false);
+            if (!deleteResult.success) {
+                return new Response(`Failed to delete existing destination file: ${deleteResult.message}`, { status: 500 });
+            }
+        }
+    } catch (error) {
+        console.error('PUT destination preparation failed:', error.stack);
+        return new Response(`Internal server error: ${error.message}`, { status: 500 });
+    }
+
     const fileContent = await request.blob();
     const formData = new FormData();
     formData.append('file', fileContent, fileName);
 
     const uploadUrl = new URL(`/upload`, request.url);
     uploadUrl.searchParams.set('uploadNameType', 'origin'); // WebDAV 规范：使用原始文件名
+    uploadUrl.searchParams.set('overwrite', 'true'); // WebDAV 规范：允许覆盖已存在的文件
     if (uploadFolder) {
         uploadUrl.searchParams.set('uploadFolder', uploadFolder);
     }
 
-    // 获取 WebDAV 配置的上传渠道
     const othersConfig = await fetchOthersConfig(env);
     const webdavConfig = othersConfig.webDAV || {};
     if (webdavConfig.uploadChannel) {
@@ -204,12 +424,12 @@ async function handlePut(request, env) {
     }
 
     try {
-        const response = await fetch(uploadUrl.toString(), { 
-            method: 'POST', 
+        const response = await fetch(uploadUrl.toString(), {
+            method: 'POST',
             body: formData,
             headers: await getApiHeaders(env)
         });
-        const result = await response.json(); 
+        const result = await response.json();
         if (response.ok && Array.isArray(result) && result.length > 0 && result[0].src) {
             return new Response(null, { status: 201 }); // Created
         } else {
@@ -227,10 +447,19 @@ async function handleDelete(request, env) {
     const path = decodeURIComponent(new URL(request.url).pathname.substring(1));
     if (!path) return new Response('Invalid path for DELETE', { status: 400 });
 
-    const isFolder = path.endsWith('/');
+    let isFolder = path.endsWith('/');
     const cleanPath = isFolder ? path.slice(0, -1) : path;
-    
-    const deleteUrl = new URL(`/api/manage/delete/${cleanPath}`, request.url);
+
+    if (!isFolder) {
+        try {
+            const resource = await resourceExists(env, request, cleanPath);
+            isFolder = resource.isFolder && !resource.isFile;
+        } catch (e) {
+            console.error('Folder check in DELETE failed:', e);
+        }
+    }
+
+    const deleteUrl = new URL(`/api/manage/delete/${encodeURIComponent(cleanPath)}`, request.url);
     if (isFolder) deleteUrl.searchParams.set('folder', 'true');
 
     try {
@@ -254,17 +483,16 @@ async function handleDelete(request, env) {
 async function handlePropfind(request, env) {
     const path = decodeURIComponent(new URL(request.url).pathname);
     const depth = request.headers.get('Depth') || '1';
-    
+
     try {
         const db = getDatabase(env);
-        
-        // 检查请求路径是否为文件
+
         let isFile = false;
         let fileInfo = null;
-        if (path !== '/') {
+        if (path !== '/' && !path.endsWith('/')) {
             const cleanPath = path.startsWith('/') ? path.substring(1) : path;
             const fileData = await db.getWithMetadata(cleanPath);
-            if (fileData && fileData.metadata) {
+            if (fileData && fileData.metadata && fileData.metadata.FileType !== 'directory') {
                 isFile = true;
                 fileInfo = {
                     name: cleanPath,
@@ -273,21 +501,17 @@ async function handlePropfind(request, env) {
             }
         }
 
-        // 检查请求路径是否为目录
         let isDir = false;
         if (path === '/') {
             isDir = true;
         } else {
             const dir = path.startsWith('/') ? path.substring(1) : path;
             const cleanDir = dir.endsWith('/') ? dir : dir + '/';
-            // 如果数据库中存在以当前路径为前缀的键，说明目录存在
-            const listResponse = await db.list({ prefix: cleanDir, limit: 1 });
-            if (listResponse.keys && listResponse.keys.length > 0) {
+            if (await collectionExists(env, request, cleanDir)) {
                 isDir = true;
             }
         }
 
-        // 如果路径既不是文件也不是目录，直接返回 404
         if (!isFile && !isDir) {
             return new Response('Not Found', { status: 404 });
         }
@@ -303,7 +527,7 @@ async function handlePropfind(request, env) {
             }
             xml = generateWebDAVXml(path, contents, depth);
         }
-        
+
         return new Response(xml, { status: 207, headers: { 'Content-Type': 'application/xml; charset=utf-8' } });
     } catch (error) {
         console.error('Propfind failed:', error.stack);
@@ -345,68 +569,95 @@ async function handleMove(request, env, context) {
     try {
         const db = getDatabase(env);
 
-        // 检查源路径是否为目录
         let isFolder = cleanSource.endsWith('/');
         let lookupSource = isFolder ? cleanSource.slice(0, -1) : cleanSource;
-
-        if (!isFolder) {
-            const listResponse = await db.list({ prefix: lookupSource + '/', limit: 1 });
-            if (listResponse.keys && listResponse.keys.length > 0) {
-                isFolder = true;
-            }
-        }
-
         let lookupDest = cleanDest.endsWith('/') ? cleanDest.slice(0, -1) : cleanDest;
 
-        // 处理覆盖逻辑：如果目标存在且允许覆盖，先将其删除
-        let destExisted = false;
-        const existingFile = await db.getWithMetadata(lookupDest);
-        if (existingFile && existingFile.value !== null) {
-            destExisted = true;
-            if (!overwrite) {
-                return new Response('Precondition Failed', { status: 412 });
-            }
-            const deleteUrl = new URL(`/api/manage/delete/${encodeURIComponent(lookupDest)}`, request.url);
-            const deleteResponse = await fetch(deleteUrl.toString(), {
-                method: 'DELETE',
-                headers: await getApiHeaders(env)
-            });
-            if (!deleteResponse.ok) {
-                return new Response('Failed to delete existing destination file', { status: 500 });
-            }
-        } else {
-            const listResponse = await db.list({ prefix: lookupDest + '/', limit: 1 });
-            if (listResponse.keys && listResponse.keys.length > 0) {
-                destExisted = true;
-                if (!overwrite) {
-                    return new Response('Precondition Failed', { status: 412 });
-                }
-                const deleteUrl = new URL(`/api/manage/delete/${encodeURIComponent(lookupDest)}`, request.url);
-                deleteUrl.searchParams.set('folder', 'true');
-                const deleteResponse = await fetch(deleteUrl.toString(), {
-                    method: 'DELETE',
-                    headers: await getApiHeaders(env)
-                });
-                if (!deleteResponse.ok) {
-                    return new Response('Failed to delete existing destination folder', { status: 500 });
-                }
-            }
+        const sourceResource = await resourceExists(env, request, lookupSource);
+        if (!sourceResource.exists) {
+            return new Response('Source Not Found', { status: 404 });
+        }
+        if (isFolder && !sourceResource.isFolder) {
+            return new Response('Source Not Found', { status: 404 });
+        }
+        if (!isFolder && !sourceResource.isFile && sourceResource.isFolder) {
+            isFolder = true;
         }
 
+        if (lookupSource === lookupDest) {
+            return new Response('Forbidden: Source and destination are the same', { status: 403 });
+        }
+
+        if (isFolder && lookupDest.startsWith(lookupSource + '/')) {
+            return new Response('Conflict: Cannot move a folder into its own subfolder', { status: 409 });
+        }
+
+        if (isFolder && lookupSource.startsWith(lookupDest + '/')) {
+            return new Response('Conflict: Cannot overwrite a parent folder with its child', { status: 409 });
+        }
+
+        let filesToMove = [];
+        let folderKey = null;
         if (isFolder) {
-            // 递归列出目录下的所有文件并重命名
             const listUrl = new URL(`/api/manage/list`, request.url);
             listUrl.searchParams.set('dir', lookupSource);
             listUrl.searchParams.set('count', -1);
             listUrl.searchParams.set('recursive', 'true');
-            
+
             const listResponse = await fetch(listUrl.toString(), { headers: await getApiHeaders(env) });
             if (!listResponse.ok) {
                 return new Response('Failed to list source folder contents', { status: 500 });
             }
             const listData = await listResponse.json();
 
-            const filesToMove = listData.files || [];
+            folderKey = lookupSource + '/';
+            filesToMove = (listData.files || []).filter(file => file.name !== folderKey);
+            const unsupportedFile = filesToMove.find(file => isUnsupportedMoveMetadata(file.metadata));
+            if (unsupportedFile) {
+                return new Response(`Unsupported source file channel: ${unsupportedFile.name}`, { status: 400 });
+            }
+        } else if (isUnsupportedMoveMetadata(sourceResource.fileData?.metadata)) {
+            return new Response('Unsupported source file channel', { status: 400 });
+        }
+
+        const destResource = await resourceExists(env, request, lookupDest);
+        const destExisted = destResource.exists;
+        if (destExisted) {
+            if (!overwrite) {
+                return new Response('Precondition Failed', { status: 412 });
+            }
+            if (isFolder && destResource.isFile) {
+                return new Response('Conflict: Cannot overwrite a file with a folder', { status: 409 });
+            }
+            if (!isFolder && destResource.isFolder) {
+                return new Response('Conflict: Cannot overwrite a folder with a file', { status: 409 });
+            }
+
+            const deleteResult = await deleteResource(env, request, lookupDest, isFolder);
+            if (!deleteResult.success) {
+                return new Response(`Failed to delete existing destination: ${deleteResult.message}`, { status: 500 });
+            }
+        }
+
+        if (isFolder) {
+            const folderEntry = await db.getWithMetadata(folderKey);
+            if (folderEntry && folderEntry.value !== null) {
+                const renameUrl = new URL(`/api/manage/rename/${encodeURIComponent(folderKey)}`, request.url);
+                const renameResponse = await fetch(renameUrl.toString(), {
+                    method: 'POST',
+                    headers: {
+                        ...(await getApiHeaders(env)),
+                        'X-WebDAV-Internal': '1',
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ newFileId: lookupDest + '/', overwrite: true })
+                });
+                if (!renameResponse.ok) {
+                    const errorMsg = await renameResponse.text();
+                    return new Response(`Failed to move folder entry: ${errorMsg}`, { status: 500 });
+                }
+            }
+
             for (const file of filesToMove) {
                 const relativePath = file.name.substring(lookupSource.length);
                 const newFileId = lookupDest + relativePath;
@@ -416,9 +667,10 @@ async function handleMove(request, env, context) {
                     method: 'POST',
                     headers: {
                         ...(await getApiHeaders(env)),
+                        'X-WebDAV-Internal': '1',
                         'Content-Type': 'application/json'
                     },
-                    body: JSON.stringify({ newFileId })
+                    body: JSON.stringify({ newFileId, overwrite: true })
                 });
 
                 if (!renameResponse.ok) {
@@ -426,7 +678,7 @@ async function handleMove(request, env, context) {
                     return new Response(`Failed to move file ${file.name}: ${errorMsg}`, { status: 500 });
                 }
             }
-            
+
             return new Response(null, { status: destExisted ? 204 : 201 });
         } else {
             // 单个文件重命名/移动
@@ -435,9 +687,10 @@ async function handleMove(request, env, context) {
                 method: 'POST',
                 headers: {
                     ...(await getApiHeaders(env)),
+                    'X-WebDAV-Internal': '1',
                     'Content-Type': 'application/json'
                 },
-                body: JSON.stringify({ newFileId: lookupDest })
+                body: JSON.stringify({ newFileId: lookupDest, overwrite: true })
             });
 
             if (renameResponse.ok) {
@@ -449,6 +702,62 @@ async function handleMove(request, env, context) {
         }
     } catch (error) {
         console.error('MOVE operation failed:', error.stack);
+        return new Response(`Internal server error: ${error.message}`, { status: 500 });
+    }
+}
+
+async function handleMkcol(request, env) {
+    const url = new URL(request.url);
+    let folderPath = decodeURIComponent(url.pathname.substring(1))
+        .replace(/\.\./g, '_')
+        .replace(/\\/g, '/')
+        .replace(/\/{2,}/g, '/')
+        .replace(/^\/+/, '');
+    if (!folderPath || folderPath === '/') {
+        return new Response('Invalid path', { status: 400 });
+    }
+    if (!folderPath.endsWith('/')) {
+        folderPath += '/';
+    }
+
+    try {
+        const db = getDatabase(env);
+
+        const filePath = folderPath.slice(0, -1);
+        const existingFile = await db.getWithMetadata(filePath);
+        if (existingFile && existingFile.value !== null && existingFile.metadata?.FileType !== 'directory') {
+            return new Response('File already exists with the same name', { status: 405 });
+        }
+
+        const existing = await db.getWithMetadata(folderPath);
+        if (existing && existing.value !== null) {
+            // Some WebDAV clients use MKCOL as an "ensure directory" operation during refresh/save.
+            return new Response(null, { status: 204 });
+        }
+
+        const now = Date.now();
+        const metadata = {
+            FileName: '',
+            FileType: 'directory',
+            FileSize: '0',
+            FileSizeBytes: 0,
+            UploadIP: request.headers.get("cf-connecting-ip") || "",
+            UploadAddress: '',
+            ListType: 'None',
+            TimeStamp: now,
+            Label: 'None',
+            Directory: folderPath.split('/').slice(0, -2).join('/') === '' ? '' : folderPath.split('/').slice(0, -2).join('/') + '/',
+            Tags: []
+        };
+
+        await db.put(folderPath, '', { metadata });
+
+        const context = { request, env, url };
+        await addFileToIndex(context, folderPath, metadata);
+
+        return new Response(null, { status: 201 });
+    } catch (error) {
+        console.error('MKCOL failed:', error.stack);
         return new Response(`Internal server error: ${error.message}`, { status: 500 });
     }
 }
@@ -469,13 +778,15 @@ async function fetchDirectoryContents(dir, env, request) {
         const errorText = await response.text();
         throw new Error(`API fetch error: Status ${response.status} - ${errorText}`);
     }
-    
+
     const result = await response.json();
     if (result.error) {
         throw new Error(`API error: ${result.error} - ${result.message}`);
     }
 
-    if (result.files && result.files.length > 0) allFiles = allFiles.concat(result.files);
+    if (result.files && result.files.length > 0) {
+        allFiles = allFiles.concat(result.files.filter(f => !f.name.endsWith('/')));
+    }
     if (result.directories && result.directories.length > 0) allDirectories = allDirectories.concat(result.directories);
 
 
@@ -489,27 +800,28 @@ function generateDirectoryListingHtml(basePath, contents) {
     let dirLinks = '';
 
     for (const dir of contents.directories) {
-        const fullDirPath = `/dav/${dir}/`;
+        const fullDirPath = encodePath(`/dav/${dir}/`);
         const dirName = dir.split('/').pop();
-        dirLinks += `<li><a href="${fullDirPath}"><strong>${dirName}/</strong></a></li>`;
+        dirLinks += `<li><a href="${fullDirPath}"><strong>${escapeHtml(dirName)}/</strong></a></li>`;
     }
 
     for (const file of contents.files) {
-        const fullFilePath = `/dav/${file.name}`; 
+        const fullFilePath = encodePath(`/dav/${file.name}`);
         const fileName = file.name.split('/').pop();
-        const fileSize = file.metadata && file.metadata['FileSize'] 
-            ? `${file.metadata['FileSize']} MB` 
+        const fileSize = file.metadata && file.metadata['FileSize']
+            ? `${file.metadata['FileSize']} MB`
             : 'N/A';
-        fileLinks += `<li><a href="${fullFilePath}">${fileName}</a> - ${fileSize}</li>`;
+        fileLinks += `<li><a href="${fullFilePath}">${escapeHtml(fileName)}</a> - ${escapeHtml(fileSize)}</li>`;
     }
-    
+
     let parentDirLink = '';
     if (basePath !== '/') {
         const parentPath = new URL('..', `http://dummy.com${basePath}`).pathname;
-        parentDirLink = `<li><a href="/dav${parentPath}"><strong>../ (Parent Directory)</strong></a></li>`;
+        parentDirLink = `<li><a href="${encodePath(`/dav${parentPath}`)}"><strong>../ (Parent Directory)</strong></a></li>`;
     }
 
-    return `<!DOCTYPE html><html><head><title>Index of ${basePath}</title><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>body{font-family:sans-serif;padding:20px}li{margin:5px 0}</style></head><body><h1>Index of ${basePath}</h1><ul>${parentDirLink}${dirLinks}${fileLinks}</ul></body></html>`;
+    const safeBasePath = escapeHtml(basePath);
+    return `<!DOCTYPE html><html><head><title>Index of ${safeBasePath}</title><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>body{font-family:sans-serif;padding:20px}li{margin:5px 0}</style></head><body><h1>Index of ${safeBasePath}</h1><ul>${parentDirLink}${dirLinks}${fileLinks}</ul></body></html>`;
 }
 
 function generateWebDAVXml(basePath, contents, depth) {
@@ -538,7 +850,7 @@ function createCollectionXml(path) {
     const pathWithSlash = path.endsWith('/') ? path : `${path}/`;
     const cleanPath = path.endsWith('/') ? path.slice(0, -1) : path;
     const name = cleanPath.split('/').pop() || '';
-    return `<D:response><D:href>${encodeURI(pathWithSlash)}</D:href><D:propstat><D:prop><D:displayname>${name}</D:displayname><D:resourcetype><D:collection/></D:resourcetype><D:creationdate>${creationDate}</D:creationdate><D:getlastmodified>${lastModified}</D:getlastmodified></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>`;
+    return `<D:response><D:href>${encodePath(pathWithSlash)}</D:href><D:propstat><D:prop><D:displayname>${escapeXml(name)}</D:displayname><D:resourcetype><D:collection/></D:resourcetype><D:creationdate>${creationDate}</D:creationdate><D:getlastmodified>${lastModified}</D:getlastmodified></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>`;
 }
 
 function createFileXml(file) {
@@ -556,5 +868,33 @@ function createFileXml(file) {
     const creationDate = fileTime.toISOString();
     const lastModified = fileTime.toUTCString();
     const contentType = file.metadata && file.metadata['FileType'] ? file.metadata['FileType'] : "application/octet-stream";
-    return `<D:response><D:href>${encodeURI(`/dav/${file.name}`)}</D:href><D:propstat><D:prop><D:displayname>${file.name.split('/').pop()}</D:displayname><D:resourcetype/><D:creationdate>${creationDate}</D:creationdate><D:getlastmodified>${lastModified}</D:getlastmodified><D:getcontentlength>${fileSize}</D:getcontentlength><D:getcontenttype>${contentType}</D:getcontenttype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>`;
+    return `<D:response><D:href>${encodePath(`/dav/${file.name}`)}</D:href><D:propstat><D:prop><D:displayname>${escapeXml(file.name.split('/').pop())}</D:displayname><D:resourcetype/><D:creationdate>${creationDate}</D:creationdate><D:getlastmodified>${lastModified}</D:getlastmodified><D:getcontentlength>${fileSize}</D:getcontentlength><D:getcontenttype>${escapeXml(contentType)}</D:getcontenttype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>`;
+}
+
+function encodePath(path) {
+    return path.split('/').map(encodeURIComponent).join('/');
+}
+
+function escapeXml(unsafe) {
+    return String(unsafe ?? '').replace(/[<>&'"]/g, function (c) {
+        switch (c) {
+            case '<': return '&lt;';
+            case '>': return '&gt;';
+            case '&': return '&amp;';
+            case '\'': return '&apos;';
+            case '"': return '&quot;';
+        }
+    });
+}
+
+function escapeHtml(value) {
+    return String(value ?? '').replace(/[<>&'"]/g, function (c) {
+        switch (c) {
+            case '<': return '&lt;';
+            case '>': return '&gt;';
+            case '&': return '&amp;';
+            case '\'': return '&#39;';
+            case '"': return '&quot;';
+        }
+    });
 }

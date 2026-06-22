@@ -2,6 +2,7 @@ import { fetchSecurityConfig } from "../utils/sysConfig";
 import { purgeCFCache, purgeRandomFileListCache, purgePublicFileListCache } from "../utils/purgeCache";
 import { addFileToIndex } from "../utils/indexManager.js";
 import { getDatabase } from '../utils/databaseAdapter.js';
+import { validateApiToken } from "../utils/auth/tokenValidator.js";
 
 // 统一的响应创建函数
 export function createResponse(body, options = {}) {
@@ -434,7 +435,7 @@ export async function isBlockedUploadIp(env, uploadIp) {
 
 // 构建唯一文件ID
 export async function buildUniqueFileId(context, fileName, fileType = 'application/octet-stream') {
-    const { env, url } = context;
+    const { env, request, url } = context;
     const db = getDatabase(env);
 
     const fileExt = resolveFileExt(fileName, fileType);
@@ -466,6 +467,16 @@ export async function buildUniqueFileId(context, fileName, fileType = 'applicati
         }
     } else {
         baseId = normalizedFolder ? `${normalizedFolder}/${unique_index}_${fileName}` : `${unique_index}_${fileName}`;
+    }
+
+    const overwrite = url.searchParams.get('overwrite') === 'true';
+    if (overwrite && nameType !== 'short') {
+        const tokenResult = request
+            ? await validateApiToken(request, db, 'manage')
+            : { valid: false };
+        if (tokenResult.valid) {
+            return baseId;
+        }
     }
 
     // 检查基础ID是否已存在

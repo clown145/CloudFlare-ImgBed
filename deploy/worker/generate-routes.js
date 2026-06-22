@@ -356,8 +356,21 @@ function responseFromHeadCache(cachedResponse) {
     });
 }
 
+function requestBypassesWorkerCache(request) {
+    const cacheControl = request.headers.get('Cache-Control') || '';
+    const pragma = request.headers.get('Pragma') || '';
+    return request.headers.get('X-WebDAV-Internal') === '1'
+        || /\\bno-cache\\b|\\bno-store\\b/i.test(cacheControl)
+        || /\\bno-cache\\b/i.test(pragma);
+}
+
+function isWorkerCacheBypassRequest(request) {
+    const pathname = new URL(request.url).pathname;
+    return pathname === '/dav' || pathname.startsWith('/dav/') || requestBypassesWorkerCache(request);
+}
+
 async function maybeServeFromCache(request, ctx, producer) {
-    if (!isCacheLookupRequest(request)) {
+    if (!isCacheLookupRequest(request) || isWorkerCacheBypassRequest(request)) {
         return await producer();
     }
 

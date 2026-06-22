@@ -1,6 +1,27 @@
 import { getDatabase } from '../../../utils/databaseAdapter.js';
 import { createApiToken, deleteApiToken } from '../apiTokens.js';
 
+const WEBDAV_INTERNAL_TOKEN_NAME = 'WebDAV Internal Token';
+const WEBDAV_INTERNAL_PERMISSIONS = ['list', 'upload', 'delete', 'manage'];
+
+async function findWebDAVInternalTokenId(db, token) {
+    if (!token) return '';
+
+    const settingsStr = await db.get('manage@sysConfig@security');
+    const settings = settingsStr ? JSON.parse(settingsStr) : {};
+    const tokens = settings.apiTokens?.tokens || {};
+
+    for (const [id, data] of Object.entries(tokens)) {
+        const isInternal = data.type === 'internal'
+            || (data.owner === 'system' && data.name === WEBDAV_INTERNAL_TOKEN_NAME);
+        if (data.token === token && isInternal) {
+            return id;
+        }
+    }
+
+    return '';
+}
+
 export async function onRequest(context) {
     // 其他设置相关，GET方法读取设置，POST方法保存设置
     const {
@@ -33,15 +54,14 @@ export async function onRequest(context) {
         // WebDAV internal token 管理
         const webDAV = settings.webDAV || {};
         const oldSettings = await getOthersConfig(db, env);
-        const wasEnabled = oldSettings.webDAV?.enabled;
         const isEnabled = webDAV.enabled;
 
         if (isEnabled && !webDAV.internalToken) {
             // 启用 WebDAV 且没有 token，创建一个 internal 类型的 API Token
             const tokenResult = await createApiToken(
                 db,
-                'WebDAV Internal Token',
-                ['list', 'upload', 'delete'],
+                WEBDAV_INTERNAL_TOKEN_NAME,
+                WEBDAV_INTERNAL_PERMISSIONS,
                 'system',
                 null,   // 不过期
                 false,  // 不自动删除
@@ -49,9 +69,14 @@ export async function onRequest(context) {
             );
             settings.webDAV.internalToken = tokenResult.token;
             settings.webDAV.internalTokenId = tokenResult.id;
-        } else if (!isEnabled && oldSettings.webDAV?.internalTokenId) {
+        } else if (!isEnabled) {
             // 禁用 WebDAV，删除 internal token
-            await deleteApiToken(db, oldSettings.webDAV.internalTokenId);
+            const tokenId = oldSettings.webDAV?.internalTokenId
+                || await findWebDAVInternalTokenId(db, oldSettings.webDAV?.internalToken);
+            if (tokenId) {
+                await deleteApiToken(db, tokenId);
+            }
+            if (!settings.webDAV) settings.webDAV = {};
             settings.webDAV.internalToken = '';
             settings.webDAV.internalTokenId = '';
         }
